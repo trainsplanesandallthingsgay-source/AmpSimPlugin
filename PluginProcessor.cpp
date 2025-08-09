@@ -46,4 +46,131 @@ double AmpSimAudioProcessor::getTailLengthSeconds() const { return 0.0; }
 int AmpSimAudioProcessor::getNumPrograms() { return 1; }
 int AmpSimAudioProcessor::getCurrentProgram() { return 0; }
 void AmpSimAudioProcessor::setCurrentProgram (int) {}
-cons
+const juce::String AmpSimAudioProcessor::getProgramName (int) { return {}; }
+void AmpSimAudioProcessor::changeProgramName (int, const juce::String&) {}
+
+void AmpSimAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+{
+    currentSampleRate = sampleRate;
+
+    juce::dsp::ProcessSpec spec;
+    spec.sampleRate = sampleRate;
+    spec.maximumBlockSize = (juce::uint32) samplesPerBlock;
+    spec.numChannels = (juce::uint32) getTotalNumOutputChannels();
+
+    lowShelf.reset(); lowShelf.prepare(spec);
+    midPeaking.reset(); midPeaking.prepare(spec);
+    highShelf.reset(); highShelf.prepare(spec);
+
+    // Setup default filter coefficients (simple shelving/peaking)
+    auto lowCoeffs = juce::dsp::IIR::Coefficients<float>::makeLowShelf(sampleRate, 120.0f, 0.7071f, juce::Decibels::decibelsToGain(0.0f));
+    auto midCoeffs = juce::dsp::IIR::Coefficients<float>::makePeakFilter(sampleRate, 800.0f, 0.7071f, juce::Decibels::decibelsToGain(0.0f));
+    auto highCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighShelf(sampleRate, 3000.0f, 0.7071f, juce::Decibels::decibelsToGain(0.0f));
+
+    *lowShelf.state = *lowCoeffs;
+    *midPeaking.state = *midCoeffs;
+    *highShelf.state = *highCoeffs;
+
+    // prepare convolution (cab) - empty for now
+    cabinetConvolver.reset();
+    cabinetLoaded = false;
+}
+
+void AmpSimAudioProcessor::releaseResources()
+{
+}
+
+#ifndef JucePlugin_PreferredChannelConfigurations
+bool AmpSimAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+{
+    // Only support stereo in/out for now
+    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+        return false;
+    if (layouts.getMainOutputChannelSet() != layouts.getMainInputChannelSet())
+        return false;
+    return true;
+}
+#endif
+
+// Simple waveshaper: tanh-based soft clipping controlled by drive
+float AmpSimAudioProcessor::applyWaveshaper(float x, float drive) noexcept
+{
+    // drive is a multiplier >0
+    float shaped = std::tanh(x * (1.0f + drive * 0.5f));
+    return shaped;
+}
+
+void AmpSimAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+    auto totalNumInputChannels  = getTotalNumInputChannels();
+    auto totalNumOutputChannels = getTotalNumOutputChannels();
+
+    // fetch parameter values
+    float inGainDb = apvts.getRawParameterValue(paramInputGain)->load();
+    float drive = apvts.getRawParameterValue(paramDrive)->load();
+    float bassDb = apvts.getRawParameterValue(paramBass)->load();
+    float midDb = apvts.getRawParameterValue(paramMid)->load();
+    float trebleDb = apvts.getRawParameterValue(paramTreble)->load();
+    float outGainDb = apvts.getRawParameterValue(paramOutputGain)->load();
+
+    float inGain = juce::Decibels::decibelsToGain(inGainDb);
+    float outGain = juce::Decibels::decibelsToGain(outGainDb);
+
+    // update filter gains (recalculate coefficients)
+    // Note: for performance, recalc only when values change - simplified here for clarity
+    *lowShelf.state = *juce::dsp::IIR::Coefficients<float>::makeLowShelf((float)currentSampleRate, 120.0f, 0.7071f, juce::Decibels::decibelsToGain(bassDb));
+    *midPeaking.state = *juce::dsp::IIR::Coefficients<float>::makePeakFilter((float)currentSampleRate, 800.0f, 0.7071f, juce::Decibels::decibelsToGain(midDb));
+    *highShelf.state = *juce::dsp::IIR::Coefficients<float>::makeHighShelf((float)currentSampleRate, 3000.0f, 0.7071f, juce::Decibels::decibelsToGain(trebleDb));
+
+    juce::dsp::AudioBlock<float> block (buffer);
+    juce::dsp::ProcessContextReplacing<float> context (block);
+
+    // Apply input gain
+    buffer.applyGain(inGain);
+
+    // Waveshaper (per sample)
+    for (int ch = 0; ch < totalNumInputChannels; ++ch)
+    {
+        auto* channelData = buffer.getWritePointer(ch);
+        for (int n = 0; n < buffer.getNumSamples(); ++n)
+        {
+            channelData[n] = applyWaveshaper(channelData[n], drive);
+        }
+    }
+
+    // Tone stack (filters)
+    lowShelf.process(context);
+    midPeaking.process(context);
+    highShelf.process(context);
+
+    // Cabinet convolution if loaded
+    if (cabinetLoaded)
+    {
+        cabinetConvolver.process(context);
+    }
+
+    // Output gain
+    buffer.applyGain(outGain);
+
+    // Clear unused channels
+    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
+        buffer.clear (i, 0, buffer.getNumSamples());
+}
+
+// Editor
+juce::AudioProcessorEditor* AmpSimAudioProcessor::createEditor() { return new class AmpSimAudioProcessorEditor (*this); }
+bool AmpSimAudioProcessor::hasEditor() const { return true; }
+
+void AmpSimAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    // Save APVTS state
+    if (auto xml = apvts.state.createXml())
+        copyXmlToBinary (*xml, destData);
+}
+
+void AmpSimAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    if (auto xmlState = getXmlFromBinary (data, sizeInBytes))
+        apvts.replaceState (juce::ValueTree::fromXml (*xmlState));
+}
